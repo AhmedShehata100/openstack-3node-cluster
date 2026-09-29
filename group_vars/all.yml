@@ -1,0 +1,75 @@
+truenas_nfs_server: "192.168.10.175"
+truenas_nfs_export: "/mnt/Primary-Pool-01/CS-NFS"
+glance_nfs_export: "{{ truenas_nfs_export }}/glance"
+glance_mount_point: "/var/lib/glance-nfs"
+
+nova_nfs_export: "{{ truenas_nfs_export }}/nova"
+nova_mount_point: "/var/lib/nova-nfs"
+
+# Set to true (via --extra-vars or here) only when actually preparing for
+# kolla-ansible deploy -- this strips bond-workload's IP so it can become
+# neutron_external_interface. Left false so the base netplan play stays safe
+# to re-run any time before that.
+strip_workload_ip: false
+
+# --- Runaway-log / disk-full guards (see the 2026-09-21 postmortem in
+# playbook.yml). These are deliberately conservative -- their whole job is
+# to make a repeat of that outage physically impossible, on this
+# deployment or any future one built from this repo.
+kolla_logs_rotate_size: "200M"     # per-file hard cap under kolla_logs
+kolla_logs_rotate_count: 5         # compressed backups to keep per file
+kolla_logrotate_interval_minutes: 15
+
+disk_guard_warn_pct: 80            # root disk usage: log a WARNING
+disk_guard_crit_pct: 90            # root disk usage: log a CRITICAL
+disk_guard_logfile_max_mb: 300     # emergency truncate threshold, per file
+disk_guard_interval_minutes: 5
+
+# Central collector for the two alerts above. Deliberately the
+# ansible-server box (hosts: localhost in the listener play below), NOT
+# one of node1/2/3 -- it can't go down from the same disk-full event it's
+# watching for. Set explicitly rather than auto-detected: this host has
+# more than one interface (192.168.30.x and 192.168.17.x) and only the
+# 192.168.17.x mgmt address is reachable from node1/2/3. On a future
+# deployment with a different control host / mgmt subnet, update this one
+# value to match.
+alerts_collector_ip: "192.168.17.15"
+alerts_collector_port: 514
+alerts_collector_logfile: /var/log/kolla-alerts.log
+
+# --- Instance-level HA (Masakari) fencing.
+#
+# Masakari can only safely auto-evacuate an instance off a node once
+# Pacemaker/Corosync can PROVE that node is truly dead, not just
+# unreachable -- that's what STONITH/fencing is for, and it's the piece
+# that was always missing (deferred "step 8"). This test cluster runs on
+# VMware VMs with no real IPMI/BMC, so we use watchdog-based self-fencing
+# (SBD, diskless/watchdog-only mode): each node reboots itself via a
+# kernel watchdog timer if it loses contact with the cluster, which lets
+# the rest of the cluster safely assume it's gone.
+#
+# On a future physical-server deployment, swap sbd_fencing_mode to
+# "ipmi" and fill in fence_agent_type / per-node BMC credentials in
+# host_vars -- nothing else in this file or in playbook.yml needs to
+# change; the Pacemaker/Corosync/Masakari setup is identical either way.
+# DISABLED as of 2026-09-27: tried on this cluster and it caused a real,
+# simultaneous reboot of all 3 nodes (not a drill). Root cause: SBD ran
+# on the HOST, but corosync/pacemaker run in Docker containers -- SBD
+# could not reach corosync's CMAP service over IPC ("Cannot initialize
+# CMAP service"), decided the cluster was unhealthy, and self-fenced
+# every node at once. ipc_mode: host on those containers shares /dev/shm
+# and SysV IPC with the host, but NOT the mount namespace, and corosync's
+# client IPC needs Unix sockets under a container-private /run/corosync
+# that the host-level sbd process can't see. Needs one of: sbd running
+# inside a container that shares corosync's mount namespace too, or a
+# bind-mounted /run/corosync path added to the hacluster role's
+# extra_volumes, before this is safe to re-enable. Do not flip this back
+# to "watchdog" without re-verifying `sbd -w /dev/watchdog -P dump` (or
+# equivalent) shows a genuinely healthy cluster servant first.
+sbd_fencing_mode: "disabled"     # "disabled" | "watchdog" (broken, see above) | "ipmi" (physical, later)
+sbd_watchdog_device: "/dev/watchdog"
+sbd_watchdog_timeout: 15          # seconds of silence before the node self-reboots
+stonith_watchdog_timeout: "30s"   # what Pacemaker waits before trusting the reboot happened (~2x sbd_watchdog_timeout)
+
+# Used only when sbd_fencing_mode == "ipmi" (physical servers, later):
+fence_agent_type: "fence_ipmilan"  # or fence_idrac / fence_ilo5 / etc per hardware brand

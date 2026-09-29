@@ -1,0 +1,14 @@
+# Managed by ansible (playbook.yml). Central collector for the
+# kolla-disk-guard / kolla-logrotate alerts emitted on node1/node2/node3
+# (see the runaway-log postmortem in playbook.yml). Runs on whichever
+# host this playbook itself is run from -- that host isn't part of the
+# OpenStack cluster, so it can't be taken out by the same disk-full event
+# it's watching for.
+module(load="imudp")
+input(type="imudp" port="{{ alerts_collector_port }}")
+
+template(name="kollaAlertFormat" type="string" string="%timestamp% %hostname% %programname%: %msg%\n")
+
+if $programname == 'kolla-disk-guard' or $programname == 'kolla-logrotate' then {
+    action(type="omfile" file="{{ alerts_collector_logfile }}" template="kollaAlertFormat")
+}

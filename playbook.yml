@@ -1,0 +1,589 @@
+---
+- hosts: node1,node2,node3
+  become: true
+  tags: netplan
+  vars:
+    netplan_path: /etc/netplan/01-netcfg.yaml
+  tasks:
+    - name: Remove old cloudstack netplan config to prevent conflicts
+      ansible.builtin.file:
+        path: /etc/netplan/50-cloudstack.yaml
+        state: absent
+
+    - name: Deploy balance-alb Netplan configuration
+      template:
+        src: netplan-config.yaml.j2
+        dest: "{{ netplan_path }}"
+        owner: root
+        group: root
+        mode: '0600'
+      notify: Apply netplan configuration
+
+  handlers:
+    - name: Apply netplan configuration
+      command: netplan apply
+
+# --- /etc/hosts: correct node1/node2/node3 entries on all 3 nodes.
+# Safe to re-run any time. Kolla's bootstrap-servers strips the 127.0.1.1
+# line automatically at deploy time -- don't remove it here.
+- hosts: node1,node2,node3
+  become: true
+  tasks:
+    - name: Deploy /etc/hosts
+      ansible.builtin.template:
+        src: hosts.j2
+        dest: /etc/hosts
+        owner: root
+        group: root
+        mode: '0644'
+
+# --- NFS client tools, needed on every node for the Glance mount below
+# and generally useful. Safe to re-run.
+- hosts: node1,node2,node3
+  become: true
+  tasks:
+    - name: Install nfs-common
+      ansible.builtin.apt:
+        name: nfs-common
+        state: present
+        update_cache: yes
+
+# --- Swap: convert an LVM swap LV to a 4G swapfile, matching node1's
+# layout. Only touches hosts that still have a "swap" LV under
+# ubuntulinux and aren't already on a swapfile -- safe to re-run, it's a
+# no-op everywhere once converted.
+- hosts: node1,node2,node3
+  become: true
+  vars:
+    vg_name: ubuntulinux
+  tasks:
+    - name: Check for an LVM swap logical volume
+      ansible.builtin.command: "lvs --noheadings -o lv_name {{ vg_name }}"
+      register: lv_list
+      changed_when: false
+      failed_when: false
+
+    - name: Check current active swap devices
+      ansible.builtin.command: swapon --show=NAME --noheadings
+      register: swapon_list
+      changed_when: false
+      failed_when: false
+
+    - name: Replace the LVM swap LV with a swapfile
+      when: >
+        lv_list.stdout is defined and 'swap' in lv_list.stdout
+        and (swapon_list.stdout is not defined or '/swap.img' not in swapon_list.stdout)
+      block:
+        - name: swapoff everything
+          ansible.builtin.command: swapoff -a
+
+        - name: Remove the swap logical volume
+          ansible.builtin.command: "lvremove -y {{ vg_name }}/swap"
+
+        - name: Drop the LV's fstab entry
+          ansible.builtin.lineinfile:
+            path: /etc/fstab
+            regexp: "{{ vg_name }}/swap"
+            state: absent
+
+        - name: Extend root to use the freed space
+          ansible.builtin.command: "lvextend -l +100%FREE /dev/{{ vg_name }}/root"
+
+        - name: Grow the root filesystem
+          ansible.builtin.command: "resize2fs /dev/{{ vg_name }}/root"
+
+        - name: Allocate a 4G swapfile
+          ansible.builtin.command: fallocate -l 4G /swap.img
+          args:
+            creates: /swap.img
+
+        - name: Lock down swapfile permissions
+          ansible.builtin.file:
+            path: /swap.img
+            mode: '0600'
+
+        - name: Format the swapfile
+          ansible.builtin.command: mkswap /swap.img
+
+        - name: Enable the swapfile
+          ansible.builtin.command: swapon /swap.img
+
+        - name: Add the swapfile to fstab
+          ansible.builtin.lineinfile:
+            path: /etc/fstab
+            line: "/swap.img\tnone\tswap\tsw\t0\t0"
+
+# --- Grow the root filesystem to fill the underlying disk.
+#
+# The virtual disk itself has to be enlarged first, in vCenter, by hand
+# (the boundary this project draws around vCenter/NSX access -- see the
+# fencing notes in group_vars/all.yml for the same reasoning). Once
+# that's done, this play claims the newly available space: grow the LVM
+# partition -> grow the PV -> grow the LV -> grow the filesystem. Each
+# step is naturally idempotent (growpart reports NOCHANGE, pvresize/
+# lvextend/resize2fs are no-ops once already at full size), so this is
+# safe to leave in the playbook permanently and just re-run any time
+# after enlarging a node's disk in vCenter.
+- hosts: node1,node2,node3
+  become: true
+  vars:
+    root_disk: /dev/sda
+    root_partition_number: 3
+    vg_name: ubuntulinux
+  tasks:
+    - name: Grow the LVM partition to fill the disk
+      ansible.builtin.command: "growpart {{ root_disk }} {{ root_partition_number }}"
+      register: growpart_result
+      changed_when: "'CHANGED' in growpart_result.stdout"
+      failed_when: >
+        growpart_result.rc != 0 and 'NOCHANGE' not in growpart_result.stdout
+
+    - name: Grow the LVM physical volume
+      ansible.builtin.command: "pvresize {{ root_disk }}{{ root_partition_number }}"
+      register: pvresize_result
+      changed_when: "'no change' not in pvresize_result.stdout"
+
+    - name: Grow the root logical volume to use all free space
+      ansible.builtin.command: "lvextend -l +100%FREE /dev/{{ vg_name }}/root"
+      register: lvextend_result
+      changed_when: "'Size of logical volume' in lvextend_result.stdout"
+      failed_when: >
+        lvextend_result.rc != 0 and
+        'matches existing size' not in (lvextend_result.stdout + lvextend_result.stderr)
+
+    - name: Grow the root filesystem to fill the logical volume
+      ansible.builtin.command: "resize2fs /dev/{{ vg_name }}/root"
+      when: lvextend_result.changed
+
+# --- TrueNAS: ensure the cinder/, glance/ and nova/ subdirectories exist
+# inside the CS-NFS export. Runs from node1 only (any node with
+# nfs-common would do). NFSv3 deliberately -- NFSv4 has a broken
+# pseudo-root on this TrueNAS instance (mount succeeds, every subsequent
+# operation fails with "Input/output error"). Safe to re-run: file/mount
+# modules are idempotent.
+#
+# nova/ was missing from this loop for a while -- the Nova NFS mount
+# play below would have failed on a brand-new TrueNAS export that never
+# had it created by hand first. Caught during a from-scratch review of
+# this playbook; fixed here so a fresh deployment doesn't hit it.
+- hosts: node1
+  become: true
+  vars:
+    tmp_mount: /mnt/cs-nfs-tmp
+  tasks:
+    - name: Create temporary mountpoint
+      ansible.builtin.file:
+        path: "{{ tmp_mount }}"
+        state: directory
+
+    - name: Mount the TrueNAS NFS export (v3)
+      ansible.posix.mount:
+        path: "{{ tmp_mount }}"
+        src: "{{ truenas_nfs_server }}:{{ truenas_nfs_export }}"
+        fstype: nfs
+        opts: "vers=3"
+        state: mounted
+
+    - name: Ensure cinder/, glance/ and nova/ subdirectories exist
+      ansible.builtin.file:
+        path: "{{ tmp_mount }}/{{ item }}"
+        state: directory
+        mode: '0777'
+      loop:
+        - cinder
+        - glance
+        - nova
+
+    - name: Unmount
+      ansible.posix.mount:
+        path: "{{ tmp_mount }}"
+        state: unmounted
+
+    - name: Remove temporary mountpoint
+      ansible.builtin.file:
+        path: "{{ tmp_mount }}"
+        state: absent
+
+# --- Glance's NFS-backed image directory, mounted persistently (fstab)
+# on all 3 nodes at the same path -- this is what globals.yml's
+# glance_file_datadir_volume will point at. Safe to re-run.
+- hosts: node1,node2,node3
+  become: true
+  tasks:
+    - name: Create the Glance NFS mount point
+      ansible.builtin.file:
+        path: "{{ glance_mount_point }}"
+        state: directory
+
+    - name: Mount and persist the Glance NFS share
+      ansible.posix.mount:
+        path: "{{ glance_mount_point }}"
+        src: "{{ truenas_nfs_server }}:{{ glance_nfs_export }}"
+        fstype: nfs
+        opts: "vers=3,_netdev"
+        state: mounted
+
+# --- Nova's instance directory (VM disks), mounted persistently (fstab) on
+# all 3 nodes at the same path -- this is what globals.yml's
+# nova_instance_datadir_volume points at, so instance disks live on shared
+# storage instead of being pinned to whichever node created them (needed
+# for Masakari evacuation of ephemeral-disk instances, not just
+# volume-backed ones). Safe to re-run.
+- hosts: node1,node2,node3
+  become: true
+  tasks:
+    - name: Create the Nova NFS mount point
+      ansible.builtin.file:
+        path: "{{ nova_mount_point }}"
+        state: directory
+
+    - name: Mount and persist the Nova NFS share
+      ansible.posix.mount:
+        path: "{{ nova_mount_point }}"
+        src: "{{ truenas_nfs_server }}:{{ nova_nfs_export }}"
+        fstype: nfs
+        opts: "vers=3,_netdev"
+        state: mounted
+
+# --- Runaway-log / disk-full guards.
+#
+# POSTMORTEM (2026-09-21): enable_masakari: yes pulls in enable_hacluster:
+# yes, which deploys Pacemaker + Corosync on all 3 nodes. Real HA
+# (fencing via SBD/IPMI, cluster resources) was never configured on top of
+# that, so the cluster could never elect a stable DC and sat in an
+# infinite re-election loop. Nothing capped hacluster_pacemaker's
+# pacemaker.log, and fluentd's own tail config doesn't even list
+# hacluster/*.log, so it grew to 16-17GB per node over ~5 days,
+# unnoticed, until it filled all 3 nodes' 39GB root disks to 100%. That
+# took down mariadb, proxysql, valkey_server, cinder_volume, masakari and
+# fluentd, and left an orphaned MariaDB transaction holding a lock on the
+# `services` table for 6 days (a mid-write transaction killed uncleanly
+# by the disk-full I/O error), which kept cinder_volume/cinder_scheduler
+# failing on every restart until that lock was found and cleared.
+#
+# The two plays below make a repeat of that specific failure mode
+# physically impossible regardless of *why* a log starts growing:
+#   1. A logrotate rule caps every file under kolla_logs and rotates it
+#      every {{ kolla_logrotate_interval_minutes }} minutes (not once a
+#      day -- a runaway needs to be caught in minutes).
+#   2. A faster disk-usage watchdog logs WARNING/CRITICAL as usage climbs
+#      and emergency-truncates any single log file that's already blown
+#      past a hard cap, as a backstop for the window before the next
+#      logrotate run.
+# Safe to re-run; templates + systemd units are idempotent.
+- hosts: node1,node2,node3
+  become: true
+  tasks:
+    - name: Deploy the kolla_logs logrotate rule
+      ansible.builtin.template:
+        src: kolla-logs-rotate.conf.j2
+        dest: /etc/logrotate.d/kolla-logs-rotate.conf
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Deploy the frequent logrotate systemd service
+      ansible.builtin.template:
+        src: kolla-logrotate.service.j2
+        dest: /etc/systemd/system/kolla-logrotate.service
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reload systemd
+
+    - name: Deploy the frequent logrotate systemd timer
+      ansible.builtin.template:
+        src: kolla-logrotate.timer.j2
+        dest: /etc/systemd/system/kolla-logrotate.timer
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reload systemd
+
+    - name: Deploy the disk-guard script
+      ansible.builtin.template:
+        src: disk-guard.sh.j2
+        dest: /usr/local/bin/disk-guard.sh
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Deploy the disk-guard systemd service
+      ansible.builtin.template:
+        src: kolla-disk-guard.service.j2
+        dest: /etc/systemd/system/kolla-disk-guard.service
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reload systemd
+
+    - name: Deploy the disk-guard systemd timer
+      ansible.builtin.template:
+        src: kolla-disk-guard.timer.j2
+        dest: /etc/systemd/system/kolla-disk-guard.timer
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reload systemd
+
+    - name: Flush systemd reload before enabling timers
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable and start both guard timers
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: yes
+        state: started
+      loop:
+        - kolla-logrotate.timer
+        - kolla-disk-guard.timer
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+# --- Central alert collector, on the ansible-server itself (localhost),
+# not on node1/2/3 -- it must stay reachable through the exact kind of
+# event it's collecting alerts about. Without this, the two guards above
+# only log locally per-node (journalctl/syslog), which is exactly the
+# "nobody was watching" failure mode from the 2026-09-21 postmortem, just
+# with a smaller blast radius. Safe to re-run.
+- hosts: localhost
+  connection: local
+  become: true
+  tasks:
+    - name: Deploy the central alert listener rsyslog config
+      ansible.builtin.template:
+        src: 10-kolla-alerts-listener.conf.j2
+        dest: /etc/rsyslog.d/10-kolla-alerts-listener.conf
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart rsyslog on the collector
+
+    - name: Ensure the alerts logfile exists
+      ansible.builtin.file:
+        path: "{{ alerts_collector_logfile }}"
+        state: touch
+        owner: syslog
+        group: adm
+        mode: '0640'
+        access_time: preserve
+        modification_time: preserve
+
+    - name: Deploy logrotate rule for the alerts logfile itself
+      ansible.builtin.template:
+        src: kolla-alerts-logfile-rotate.conf.j2
+        dest: /etc/logrotate.d/kolla-alerts-logfile.conf
+        owner: root
+        group: root
+        mode: '0644'
+
+  handlers:
+    - name: Restart rsyslog on the collector
+      ansible.builtin.systemd:
+        name: rsyslog
+        state: restarted
+
+# --- Forward the same two alerts from node1/2/3 to the central
+# collector above, in addition to (not instead of) each node's own
+# local journal/syslog. Safe to re-run.
+- hosts: node1,node2,node3
+  become: true
+  tasks:
+    - name: Deploy the alert-forwarding rsyslog config
+      ansible.builtin.template:
+        src: 10-kolla-alerts-forward.conf.j2
+        dest: /etc/rsyslog.d/10-kolla-alerts-forward.conf
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart rsyslog on the node
+
+  handlers:
+    - name: Restart rsyslog on the node
+      ansible.builtin.systemd:
+        name: rsyslog
+        state: restarted
+
+# --- Instance-level HA fencing: SBD watchdog self-fencing (see the
+# sbd_fencing_mode note in group_vars/all.yml for why, and what changes
+# on a future physical deployment). Only runs when sbd_fencing_mode is
+# "watchdog"; a future "ipmi" mode would need a different play instead
+# (fence_ipmilan / vendor agent + per-node BMC credentials), not this one.
+# Safe to re-run.
+- hosts: node1,node2,node3
+  become: true
+  tasks:
+    - name: Persist the softdog kernel module across reboots
+      ansible.builtin.copy:
+        content: "softdog\n"
+        dest: /etc/modules-load.d/softdog.conf
+        owner: root
+        group: root
+        mode: '0644'
+      when: sbd_fencing_mode == "watchdog"
+
+    - name: Load the softdog module now
+      community.general.modprobe:
+        name: softdog
+        state: present
+      when: sbd_fencing_mode == "watchdog"
+
+    - name: Install sbd
+      ansible.builtin.apt:
+        name: sbd
+        state: present
+      when: sbd_fencing_mode == "watchdog"
+
+    - name: Deploy /etc/default/sbd
+      ansible.builtin.template:
+        src: sbd-defaults.j2
+        dest: /etc/default/sbd
+        owner: root
+        group: root
+        mode: '0644'
+      when: sbd_fencing_mode == "watchdog"
+      notify: Restart sbd-watch
+
+    - name: Deploy the standalone sbd-watch systemd unit
+      ansible.builtin.template:
+        src: kolla-sbd-watch.service.j2
+        dest: /etc/systemd/system/kolla-sbd-watch.service
+        owner: root
+        group: root
+        mode: '0644'
+      when: sbd_fencing_mode == "watchdog"
+      notify: Restart sbd-watch
+
+    - name: Flush before enabling sbd-watch
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable and start sbd-watch
+      ansible.builtin.systemd:
+        name: kolla-sbd-watch.service
+        daemon_reload: yes
+        enabled: yes
+        state: started
+      when: sbd_fencing_mode == "watchdog"
+
+    - name: Ensure sbd-watch is stopped and disabled when not in watchdog mode
+      ansible.builtin.systemd:
+        name: kolla-sbd-watch.service
+        enabled: false
+        state: stopped
+      when: sbd_fencing_mode != "watchdog"
+      failed_when: false
+
+  handlers:
+    - name: Restart sbd-watch
+      ansible.builtin.systemd:
+        name: kolla-sbd-watch.service
+        daemon_reload: yes
+        state: restarted
+
+# --- Keep hacluster_pacemaker/hacluster_corosync stopped when fencing
+# isn't configured (sbd_fencing_mode: "disabled" in group_vars/all.yml).
+#
+# Lesson learned: `docker stop` alone does NOT keep these off. Kolla
+# generates real systemd units for these two containers
+# (kolla-hacluster_pacemaker-container.service /
+# kolla-hacluster_corosync-container.service) with RequiredBy= on each
+# other, and re-running `kolla-ansible deploy` (e.g. to enable another
+# service, or on a routine reconfigure) re-enables and re-starts them
+# regardless of any earlier manual `docker stop`. This task must be
+# re-applied (or just re-run the whole playbook) after any
+# `kolla-ansible deploy`/`reconfigure` for as long as fencing stays
+# unconfigured, or the infinite-DC-election/disk-fill failure mode from
+# the 2026-09-21 postmortem can recur. Safe to re-run.
+- hosts: node1,node2,node3
+  become: true
+  tasks:
+    - name: Stop and disable hacluster systemd units when fencing is not configured
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+        daemon_reload: yes
+      loop:
+        - kolla-hacluster_pacemaker-container.service
+        - kolla-hacluster_corosync-container.service
+      when: sbd_fencing_mode == "disabled"
+      failed_when: false
+
+# --- Cluster-wide Pacemaker properties for watchdog fencing. A CIB
+# change is cluster-wide by nature, so this only needs to run from one
+# node -- node1 here, arbitrarily. Idempotent: crm_attribute setting the
+# same value again is a no-op.
+- hosts: node1
+  become: true
+  tasks:
+    - name: Tell Pacemaker to trust SBD watchdog self-fencing
+      ansible.builtin.command:
+        cmd: >
+          docker exec hacluster_pacemaker crm_attribute
+          --type crm_config --name stonith-watchdog-timeout
+          --update {{ stonith_watchdog_timeout }}
+      when: sbd_fencing_mode == "watchdog"
+      changed_when: false
+
+    - name: Enable STONITH on the cluster
+      ansible.builtin.command:
+        cmd: >
+          docker exec hacluster_pacemaker crm_attribute
+          --type crm_config --name stonith-enabled --update true
+      changed_when: false
+      when: sbd_fencing_mode != "disabled"
+
+# --- OVS bridge admin-up guard (see the postmortem comment in
+# kolla-ovs-bridges-up.service.j2). Runs at boot and every 5 minutes
+# after, so br-ex/br-int coming up DOWN can never again silently kill
+# external/floating-IP connectivity until someone happens to notice.
+# Safe to re-run.
+- hosts: node1,node2,node3
+  become: true
+  tasks:
+    - name: Deploy the OVS bridges-up script
+      ansible.builtin.template:
+        src: kolla-ovs-bridges-up.sh.j2
+        dest: /usr/local/bin/kolla-ovs-bridges-up.sh
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Deploy the OVS bridges-up systemd service
+      ansible.builtin.template:
+        src: kolla-ovs-bridges-up.service.j2
+        dest: /etc/systemd/system/kolla-ovs-bridges-up.service
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reload systemd for ovs-bridges-up
+
+    - name: Deploy the OVS bridges-up timer
+      ansible.builtin.template:
+        src: kolla-ovs-bridges-up.timer.j2
+        dest: /etc/systemd/system/kolla-ovs-bridges-up.timer
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reload systemd for ovs-bridges-up
+
+    - name: Flush before enabling ovs-bridges-up
+      ansible.builtin.meta: flush_handlers
+
+    - name: Run it now and enable the timer for future boots/restarts
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        daemon_reload: yes
+        enabled: yes
+        state: started
+      loop:
+        - kolla-ovs-bridges-up.service
+        - kolla-ovs-bridges-up.timer
+
+  handlers:
+    - name: Reload systemd for ovs-bridges-up
+      ansible.builtin.systemd:
+        daemon_reload: yes

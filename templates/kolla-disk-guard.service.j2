@@ -1,0 +1,7 @@
+# Managed by ansible (playbook.yml).
+[Unit]
+Description=Disk usage / runaway kolla_logs guard
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/disk-guard.sh

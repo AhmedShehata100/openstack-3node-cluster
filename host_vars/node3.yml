@@ -1,0 +1,12 @@
+node_name: "node3"
+mgmt_ip: "192.168.17.13"
+mgmt_gw: "192.168.17.254"
+storage_ip: "192.168.10.13"
+workload_ip: "192.168.18.13"
+
+nic_mgmt_1: "ens224"
+nic_mgmt_2: "ens256"
+nic_storage_1: "ens225"
+nic_storage_2: "ens257"
+nic_workload_1: "ens161"
+nic_workload_2: "ens193"

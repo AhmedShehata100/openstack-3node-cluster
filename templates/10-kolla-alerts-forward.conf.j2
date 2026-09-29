@@ -1,0 +1,9 @@
+# Managed by ansible (playbook.yml). Forwards kolla-disk-guard /
+# kolla-logrotate alerts to the central collector, in addition to (not
+# instead of) this node's own local journal/syslog -- see the
+# runaway-log postmortem in playbook.yml. If the collector is unreachable
+# this is a no-op for local logging; disk-guard.sh's own journalctl/
+# syslog entries on this node are unaffected either way.
+if $programname == 'kolla-disk-guard' or $programname == 'kolla-logrotate' then {
+    action(type="omfwd" target="{{ alerts_collector_ip }}" port="{{ alerts_collector_port }}" protocol="udp")
+}

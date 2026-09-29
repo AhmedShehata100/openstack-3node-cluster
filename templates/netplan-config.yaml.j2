@@ -1,0 +1,55 @@
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    {{ nic_mgmt_1 }}:
+      dhcp4: no
+    {{ nic_mgmt_2 }}:
+      dhcp4: no
+    {{ nic_storage_1 }}:
+      dhcp4: no
+    {{ nic_storage_2 }}:
+      dhcp4: no
+    {{ nic_workload_1 }}:
+      dhcp4: no
+    {{ nic_workload_2 }}:
+      dhcp4: no
+
+  bonds:
+    bond-mgmt:
+      interfaces:
+        - "{{ nic_mgmt_1 }}"
+        - "{{ nic_mgmt_2 }}"
+      parameters:
+        mode: active-backup
+        primary: "{{ nic_mgmt_1 }}"
+      addresses:
+        - "{{ mgmt_ip }}/24"
+      routes:
+        - to: default
+          via: "{{ mgmt_gw }}"
+      nameservers:
+        addresses:
+          - 8.8.8.8
+
+    bond-storage:
+      interfaces:
+        - "{{ nic_storage_1 }}"
+        - "{{ nic_storage_2 }}"
+      parameters:
+        mode: active-backup
+        primary: "{{ nic_storage_1 }}"
+      addresses:
+        - "{{ storage_ip }}/24"
+
+    bond-workload:
+      interfaces:
+        - "{{ nic_workload_1 }}"
+        - "{{ nic_workload_2 }}"
+      parameters:
+        mode: active-backup
+        primary: "{{ nic_workload_1 }}"
+{% if not strip_workload_ip | default(false) %}
+      addresses:
+        - "{{ workload_ip }}/24"
+{% endif %}

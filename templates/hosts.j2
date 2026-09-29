@@ -1,0 +1,19 @@
+127.0.0.1	localhost
+
+# Deliberately NOT setting "127.0.1.1 <hostname>" here (the Debian/Ubuntu
+# default convention) -- RabbitMQ/Erlang's epmd resolves this node's own
+# hostname via gethostbyname(), which returns ALL matching /etc/hosts
+# entries; with both a 127.0.1.1 and a real-IP line present it can pick
+# 127.0.1.1 first, then fail to reach epmd (which ERL_EPMD_ADDRESS binds
+# only to the real IP) with "epmd error for host X: address". Kolla's own
+# bootstrap-servers already strips this line for the same reason -- don't
+# reintroduce it.
+192.168.17.11	node1
+192.168.17.12	node2
+192.168.17.13	node3
+
+::1     ip6-localhost ip6-loopback
+fe00::0 ip6-localnet
+ff00::0 ip6-mcastprefix
+ff02::1 ip6-allnodes
+ff02::2 ip6-allrouters

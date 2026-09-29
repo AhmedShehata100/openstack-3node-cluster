@@ -1,0 +1,11 @@
+# Managed by ansible (playbook.yml).
+[Unit]
+Description=Run the disk usage / runaway log guard every {{ disk_guard_interval_minutes }} minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec={{ disk_guard_interval_minutes }}min
+Unit=kolla-disk-guard.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,23 @@
+#!/bin/bash
+# Managed by ansible (playbook.yml). See kolla-ovs-bridges-up.service
+# for why this exists. Waits for the OVS bridges to exist (the
+# openvswitch_vswitchd container needs to be up first) then makes sure
+# they're admin-up -- retries for up to 2 minutes since container
+# startup ordering after a fresh boot isn't guaranteed.
+set -u
+
+BRIDGES="br-ex br-int"
+MAX_WAIT=120
+elapsed=0
+
+for br in $BRIDGES; do
+    while [ "$elapsed" -lt "$MAX_WAIT" ]; do
+        if ip link show "$br" &>/dev/null; then
+            ip link set "$br" up
+            logger -t kolla-ovs-bridges-up "brought $br up"
+            break
+        fi
+        sleep 3
+        elapsed=$((elapsed + 3))
+    done
+done

@@ -1,0 +1,27 @@
+# Managed by ansible (playbook.yml).
+#
+# The Ubuntu `sbd` package ships its own sbd.service, but it's written
+# for a traditional bare-metal Pacemaker install: it's PartOf/RequiredBy
+# a native corosync.service/pacemaker.service, and RefuseManualStart=true
+# blocks starting it any other way. Our corosync/pacemaker run as Docker
+# containers (hacluster_corosync / hacluster_pacemaker), so that unit's
+# ordering never triggers -- hence this standalone unit, tied to Docker
+# instead. SBD talks to the containerized corosync/pacemaker over their
+# shared-memory IPC (both those containers run with ipc_mode: host).
+[Unit]
+Description=SBD watchdog fencing daemon (containerized corosync/pacemaker)
+Documentation=man:sbd(8)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=forking
+PIDFile=/run/sbd.pid
+EnvironmentFile=-/etc/default/sbd
+ExecStart=/usr/sbin/sbd $SBD_OPTS -p /run/sbd.pid watch
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

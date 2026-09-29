@@ -1,0 +1,13 @@
+# Managed by ansible (playbook.yml). Watchdog-only (diskless) SBD -- no
+# shared block device needed, just the local /dev/watchdog. See the
+# fencing design notes in playbook.yml for why (containerized
+# corosync/pacemaker under Kolla, VMware test cluster with only a
+# software watchdog available -- softdog, not a real hardware one).
+SBD_PACEMAKER=yes
+SBD_STARTMODE=always
+SBD_DELAY_START=no
+SBD_WATCHDOG_DEV={{ sbd_watchdog_device }}
+SBD_WATCHDOG_TIMEOUT={{ sbd_watchdog_timeout }}
+SBD_TIMEOUT_ACTION=flush,reboot
+SBD_MOVE_TO_ROOT_CGROUP=auto
+SBD_OPTS=

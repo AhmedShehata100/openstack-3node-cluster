@@ -1,0 +1,11 @@
+# Managed by ansible (playbook.yml).
+[Unit]
+Description=Run kolla_logs rotation every {{ kolla_logrotate_interval_minutes }} minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec={{ kolla_logrotate_interval_minutes }}min
+Unit=kolla-logrotate.service
+
+[Install]
+WantedBy=timers.target

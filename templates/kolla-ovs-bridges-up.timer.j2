@@ -1,0 +1,14 @@
+# Managed by ansible (playbook.yml). Belt-and-suspenders: re-asserts
+# br-ex/br-int admin-up periodically too, not just once at boot, in case
+# something else (an OVS restart, a container recreate) drops them again
+# outside of a full host reboot.
+[Unit]
+Description=Periodically ensure OVS bridges stay admin-up
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+Unit=kolla-ovs-bridges-up.service
+
+[Install]
+WantedBy=timers.target

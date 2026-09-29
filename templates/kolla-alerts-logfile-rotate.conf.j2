@@ -1,0 +1,11 @@
+# Managed by ansible (playbook.yml). The collector file itself must not
+# become an unbounded-growth risk on the ansible-server -- rotate it
+# like everything else.
+{{ alerts_collector_logfile }} {
+    size 50M
+    rotate 10
+    compress
+    missingok
+    notifempty
+    copytruncate
+}

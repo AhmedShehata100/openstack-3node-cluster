@@ -1,0 +1,24 @@
+# Managed by ansible (playbook.yml) -- blanket size-capped rotation for
+# every log file under the kolla_logs Docker volume.
+#
+# Why this exists: on 2026-09-21, hacluster_pacemaker's pacemaker.log grew
+# to 16-17GB per node (an unconfigured Pacemaker/Corosync cluster stuck in
+# an infinite DC re-election loop, since enable_masakari pulls in
+# enable_hacluster with no fencing/resources ever set up). Nothing on the
+# host capped that file's size, and fluentd's own tail config
+# (/etc/fluentd/fluentd.conf) never even lists hacluster/*.log, so it went
+# unnoticed until it filled all 3 nodes' root disks to 100% and crashed
+# mariadb, proxysql, valkey, cinder_volume, masakari and fluentd itself.
+#
+# This rule caps ANY file under kolla_logs, not just pacemaker.log, so a
+# future runaway log (from any service, for any reason) can't repeat that
+# outage. copytruncate is required because the writer is a process inside
+# a container we can't signal to reopen its log fd.
+/var/lib/docker/volumes/kolla_logs/_data/*/*.log {
+    size {{ kolla_logs_rotate_size }}
+    rotate {{ kolla_logs_rotate_count }}
+    compress
+    missingok
+    notifempty
+    copytruncate
+}

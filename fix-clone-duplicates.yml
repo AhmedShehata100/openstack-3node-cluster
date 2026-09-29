@@ -1,0 +1,46 @@
+---
+# Fixes the "cloned VM without regenerating identity" symptoms: duplicate
+# /etc/machine-id (which makes systemd-networkd generate identical bond
+# MAC addresses on cloned hosts) and duplicate SSH host keys.
+#
+# NOT safe to run routinely / blindly across the whole fleet -- it changes
+# host identity and requires a reboot. Only point this at a host you've
+# confirmed shares a machine-id or SSH host key with another host in the
+# fleet, e.g.:
+#
+#   ansible-playbook fix-clone-duplicates.yml -i multinode --limit node3
+#
+# Verify first with:
+#   ansible all -i multinode -m shell -a "cat /etc/machine-id"
+#   ansible all -i multinode -m shell -a "ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub"
+
+- hosts: node1,node2,node3
+  become: true
+  tasks:
+    - name: Regenerate machine-id
+      ansible.builtin.command: "{{ item }}"
+      loop:
+        - truncate -s 0 /etc/machine-id
+        - systemd-machine-id-setup
+
+    - name: Re-link /var/lib/dbus/machine-id
+      ansible.builtin.file:
+        src: /etc/machine-id
+        dest: /var/lib/dbus/machine-id
+        state: link
+        force: true
+
+    - name: Remove existing SSH host keys
+      ansible.builtin.shell: rm -f /etc/ssh/ssh_host_*
+
+    - name: Regenerate SSH host keys
+      ansible.builtin.command: ssh-keygen -A
+
+    - name: Restart sshd to pick up the new host keys
+      ansible.builtin.systemd:
+        name: ssh
+        state: restarted
+
+    - name: Reboot to pick up the new machine-id-derived bond MAC
+      ansible.builtin.reboot:
+        reboot_timeout: 180

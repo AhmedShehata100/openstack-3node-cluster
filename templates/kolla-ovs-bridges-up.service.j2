@@ -1,0 +1,22 @@
+# Managed by ansible (playbook.yml).
+#
+# POSTMORTEM (2026-09-27): after the 3 nodes rebooted together, OVS
+# still created br-ex/br-int correctly (its own OVSDB volume persists
+# fine), but the *kernel* network interfaces for those bridges came up
+# in state DOWN and nothing brought them back up -- silently killing all
+# floating-IP / external connectivity (ARP for the floating IP never
+# left the box) until noticed and fixed by hand with `ip link set br-ex
+# up`. This unit makes that fix permanent and automatic on every boot,
+# regardless of why the interface ended up down.
+[Unit]
+Description=Ensure OVS bridges (br-ex, br-int) are admin-up
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/kolla-ovs-bridges-up.sh
+
+[Install]
+WantedBy=multi-user.target

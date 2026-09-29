@@ -1,0 +1,39 @@
+#!/bin/bash
+# Managed by ansible (playbook.yml).
+#
+# Why this exists: the 2026-09-21 outage was a runaway pacemaker.log
+# filling the root disk to 100%, undetected for days because nothing
+# watched disk usage or capped an individual log file's size in real
+# time (the 15-minute logrotate timer is the slower, general-purpose net;
+# this is the fast, disk-usage-aware backstop). Runs frequently via
+# kolla-disk-guard.timer.
+set -euo pipefail
+
+DISK_WARN_PCT={{ disk_guard_warn_pct }}
+DISK_CRIT_PCT={{ disk_guard_crit_pct }}
+LOGFILE_MAX_BYTES={{ disk_guard_logfile_max_mb }}000000
+KOLLA_LOGS_DIR=/var/lib/docker/volumes/kolla_logs/_data
+
+usage_pct=$(df --output=pcent / | tail -1 | tr -dc '0-9')
+
+if [ "${usage_pct}" -ge "${DISK_CRIT_PCT}" ]; then
+    logger -p daemon.crit -t kolla-disk-guard "CRITICAL: root disk at ${usage_pct}% -- check kolla_logs for a runaway log immediately"
+elif [ "${usage_pct}" -ge "${DISK_WARN_PCT}" ]; then
+    logger -p daemon.warning -t kolla-disk-guard "WARNING: root disk at ${usage_pct}%"
+fi
+
+# Belt-and-suspenders: truncate any single log file that has already
+# blown past the hard cap, regardless of what the periodic logrotate
+# timer would otherwise catch on its next run.
+if [ -d "${KOLLA_LOGS_DIR}" ]; then
+    find "${KOLLA_LOGS_DIR}" -type f -name '*.log' -size +"${LOGFILE_MAX_BYTES}"c 2>/dev/null | while read -r f; do
+        size_before=$(du -h "$f" | cut -f1)
+        # No backup copy here on purpose: this only fires once a file has
+        # already blown past the hard emergency cap, i.e. disk space is
+        # exactly what's short -- doubling the file first would defeat
+        # the point. The regular logrotate timer (smaller threshold,
+        # keeps compressed backups) is what normally catches this first.
+        : > "$f"
+        logger -p daemon.crit -t kolla-disk-guard "emergency-truncated oversized log ${f} (was ${size_before}, over ${DISK_CRIT_PCT}% cap) with no backup -- disk space was critical"
+    done
+fi

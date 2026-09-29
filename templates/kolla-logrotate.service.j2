@@ -1,0 +1,10 @@
+# Managed by ansible (playbook.yml). Runs logrotate against
+# kolla-logs-rotate.conf on its own state file, independent of the
+# system's daily logrotate run -- a runaway log needs to be caught in
+# minutes, not once a day.
+[Unit]
+Description=Rotate oversized kolla_logs files
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/logrotate -s /var/lib/logrotate-kolla.status /etc/logrotate.d/kolla-logs-rotate.conf

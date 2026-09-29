@@ -1,0 +1,11 @@
+# Large/one-off files that don't belong in version control
+*.iso
+*.img
+*.qcow2
+
+# Generated outputs kept local-only (per project convention -- not pushed to git)
+RUNBOOK.pdf
+healthcheck.sh
+
+# Ansible retry files
+*.retry
