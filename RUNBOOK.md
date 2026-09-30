@@ -512,6 +512,26 @@ pip install python-octaviaclient python-designateclient \
   python-watcherclient python-swiftclient
 ```
 
+**Lesson learned (Horizon):** enabling a new service also adds that
+service's dashboard panel to Horizon — new Angular templates/JS/CSS.
+Horizon runs with `COMPRESS_OFFLINE = True`, which requires a
+pre-built manifest mapping each page's exact combination of static
+assets to a pre-compressed bundle. Enabling a service changes those
+combinations without regenerating the manifest, so pages that pull in
+the new panel's assets start failing with `compressor.exceptions.
+OfflineGenerationError: ... is missing from offline manifest` — while
+pages whose asset combination didn't change keep working, which looks
+like a random intermittent fault rather than a specific missing step.
+`kolla-ansible deploy` does **not** regenerate this by itself when only
+`globals.yml`'s `enable_*` flags changed (no container config diff, so
+it skips recreating the Horizon container). This project's
+`playbook.yml` now includes a play that regenerates it and restarts
+Horizon — just re-run the playbook after enabling any new
+Horizon-facing service:
+```bash
+ansible-playbook -i multinode playbook.yml
+```
+
 ---
 
 ## 18. What's deliberately NOT done yet

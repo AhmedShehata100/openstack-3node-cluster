@@ -536,6 +536,38 @@
       changed_when: false
       when: sbd_fencing_mode != "disabled"
 
+# --- Regenerate Horizon's static-asset compression manifest.
+#
+# POSTMORTEM (2026-09-29): enabling a new service (Barbican, Octavia,
+# Designate, Magnum, Trove, Watcher, ...) adds that service's dashboard
+# panel -- new Angular templates/JS/CSS -- to Horizon. Horizon runs with
+# `COMPRESS_OFFLINE = True`, which requires a pre-built manifest mapping
+# each page's exact combination of static assets to a pre-compressed
+# bundle; enabling a service changes those combinations without
+# regenerating the manifest, so pages that pull in the new panel's
+# assets fail with `compressor.exceptions.OfflineGenerationError:
+# ... is missing from offline manifest` -- while pages whose asset
+# combination didn't change keep working fine, making it look like a
+# random, intermittent fault rather than a specific missing step.
+# `kolla-ansible deploy` does NOT regenerate this by itself when only
+# globals.yml's enable_* flags changed (no container config diff, so it
+# skips recreating horizon). Re-run this task (or the whole playbook)
+# after enabling any new Horizon-facing service. Idempotent, but always
+# reports changed since it regenerates the manifest fresh each run.
+- hosts: node1,node2,node3
+  become: true
+  tasks:
+    - name: Regenerate Horizon's offline compression manifest
+      ansible.builtin.command:
+        cmd: docker exec horizon /var/lib/kolla/venv/bin/manage.py compress --force
+      register: horizon_compress_result
+      changed_when: "'Compressed' in horizon_compress_result.stdout"
+
+    - name: Restart Horizon to pick up the regenerated manifest
+      ansible.builtin.command:
+        cmd: docker restart horizon
+      when: horizon_compress_result.changed
+
 # --- OVS bridge admin-up guard (see the postmortem comment in
 # kolla-ovs-bridges-up.service.j2). Runs at boot and every 5 minutes
 # after, so br-ex/br-int coming up DOWN can never again silently kill
